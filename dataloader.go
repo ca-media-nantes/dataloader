@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/brunomvsouza/singleflight"
 )
 
 // Interface is a `DataLoader` Interface which defines a public API for loading data from a particular
@@ -99,6 +101,8 @@ type Loader[K comparable, V any] struct {
 
 	// can be set to trace calls to dataloader
 	tracer Tracer[K, V]
+
+	group singleflight.Group[K, Thunk[V]]
 }
 
 // Thunk is a function that will block until the value (*Result) it contains is resolved.
@@ -203,78 +207,78 @@ func NewBatchedLoader[K comparable, V any](batchFn BatchFunc[K, V], opts ...Opti
 func (l *Loader[K, V]) Load(originalContext context.Context, key K) Thunk[V] {
 	ctx, finish := l.tracer.TraceLoad(originalContext, key)
 
-	c := make(chan *Result[V], 1)
-	var result struct {
-		mu    sync.RWMutex
-		value *Result[V]
-	}
+	thunk, _, _ := l.group.Do(key, func() (Thunk[V], error) {
+		c := make(chan *Result[V], 1)
+		var result struct {
+			mu    sync.RWMutex
+			value *Result[V]
+		}
 
-	// lock to prevent duplicate keys coming in before item has been added to cache.
-	l.cacheLock.Lock()
-	if v, ok := l.cache.Get(ctx, key); ok {
-		defer finish(v)
-		defer l.cacheLock.Unlock()
-		return v
-	}
+		if v, ok := l.cache.Get(ctx, key); ok {
+			return v, nil
+		}
 
-	thunk := func() (V, error) {
-		result.mu.RLock()
-		resultNotSet := result.value == nil
-		result.mu.RUnlock()
+		thunk := func() (V, error) {
+			result.mu.RLock()
+			resultNotSet := result.value == nil
+			result.mu.RUnlock()
 
-		if resultNotSet {
-			result.mu.Lock()
-			if v, ok := <-c; ok {
-				result.value = v
+			if resultNotSet {
+				result.mu.Lock()
+				if v, ok := <-c; ok {
+					result.value = v
+				}
+				result.mu.Unlock()
 			}
-			result.mu.Unlock()
+			result.mu.RLock()
+			defer result.mu.RUnlock()
+			var ev *PanicErrorWrapper
+			if result.value.Error != nil && errors.As(result.value.Error, &ev) {
+				l.Clear(ctx, key)
+			}
+			return result.value.Data, result.value.Error
 		}
-		result.mu.RLock()
-		defer result.mu.RUnlock()
-		var ev *PanicErrorWrapper
-		if result.value.Error != nil && errors.As(result.value.Error, &ev) {
-			l.Clear(ctx, key)
+
+		l.cache.Set(ctx, key, thunk)
+
+		// this is sent to batch fn. It contains the key and the channel to return
+		// the result on
+		req := &batchRequest[K, V]{key, c}
+
+		l.batchLock.Lock()
+		// start the batch window if it hasn't already started.
+		if l.curBatcher == nil {
+			l.curBatcher = l.newBatcher(l.silent, l.tracer)
+			// start the current batcher batch function
+			go l.curBatcher.batch(originalContext)
+			// start a sleeper for the current batcher
+			l.endSleeper = make(chan bool)
+			go l.sleeper(l.curBatcher, l.endSleeper)
 		}
-		return result.value.Data, result.value.Error
-	}
-	defer finish(thunk)
 
-	l.cache.Set(ctx, key, thunk)
-	l.cacheLock.Unlock()
+		l.curBatcher.input <- req
 
-	// this is sent to batch fn. It contains the key and the channel to return
-	// the result on
-	req := &batchRequest[K, V]{key, c}
-
-	l.batchLock.Lock()
-	// start the batch window if it hasn't already started.
-	if l.curBatcher == nil {
-		l.curBatcher = l.newBatcher(l.silent, l.tracer)
-		// start the current batcher batch function
-		go l.curBatcher.batch(originalContext)
-		// start a sleeper for the current batcher
-		l.endSleeper = make(chan bool)
-		go l.sleeper(l.curBatcher, l.endSleeper)
-	}
-
-	l.curBatcher.input <- req
-
-	// if we need to keep track of the count (max batch), then do so.
-	if l.batchCap > 0 {
-		l.count++
-		// if we hit our limit, force the batch to start
-		if l.count == l.batchCap {
-			// end the batcher synchronously here because another call to Load
-			// may concurrently happen and needs to go to a new batcher.
-			l.curBatcher.end()
-			// end the sleeper for the current batcher.
-			// this is to stop the goroutine without waiting for the
-			// sleeper timeout.
-			close(l.endSleeper)
-			l.reset()
+		// if we need to keep track of the count (max batch), then do so.
+		if l.batchCap > 0 {
+			l.count++
+			// if we hit our limit, force the batch to start
+			if l.count == l.batchCap {
+				// end the batcher synchronously here because another call to Load
+				// may concurrently happen and needs to go to a new batcher.
+				l.curBatcher.end()
+				// end the sleeper for the current batcher.
+				// this is to stop the goroutine without waiting for the
+				// sleeper timeout.
+				close(l.endSleeper)
+				l.reset()
+			}
 		}
-	}
-	l.batchLock.Unlock()
+		l.batchLock.Unlock()
+
+		return thunk, nil
+	})
+
+	finish(thunk)
 
 	return thunk
 }

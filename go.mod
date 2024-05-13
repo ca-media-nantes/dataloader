@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/brunomvsouza/singleflight v0.4.0 // indirect
 	github.com/go-logr/logr v1.2.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 )
